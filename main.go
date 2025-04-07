@@ -1,171 +1,321 @@
+/*
+ * Copyright (C) 2019 The "MysteriumNetwork/openvpn-forwarder" Authors.
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
 package main
 
 import (
+	"flag"
 	"fmt"
-	"io"
-	"log"
 	"net"
-	"net/http"
+	"net/url"
+	"os"
 	"strings"
-	"time"
+	"sync"
+
+	log "github.com/cihub/seelog"
+	"github.com/pkg/errors"
+	netproxy "golang.org/x/net/proxy"
+
+	"github.com/mysteriumnetwork/openvpn-forwarder/api"
+	"github.com/mysteriumnetwork/openvpn-forwarder/metrics"
+	"github.com/mysteriumnetwork/openvpn-forwarder/proxy"
 )
 
-type Proxy struct {
-	// Configuration options
-	AllowedHosts []string
-	Verbose      bool
-}
+var logLevel = flag.String("log.level", log.InfoStr, "Set the logging level (trace, debug, info, warn, error, critical)")
+var proxyAddr = flag.String("proxy.bind", ":8443", `Proxy address for incoming connections, by default "0.0.0.0:8443`)
+var proxyAllow = FlagArray("proxy.allow", `Proxy allows connection from these addresses only (separated by comma - "10.13.0.1,10.13.0.0/16")`)
+var proxyAPIAddr = flag.String("proxy.api-bind", "127.0.0.1:8000", `HTTP proxy API address, by default "127.0.0.1:8000")`)
+var upstreamConfigs = FlagUpstreamConfig()
+var proxyMapPort = FlagArray(
+	"proxy.port-map",
+	`Explicitly map source port to destination port (separated by comma - "8443:443,18443:8443")`,
+)
+var stickyStoragePath = flag.String("stickiness-db-path", proxy.MemoryStorage, "Path to the database for stickiness mapping")
+var enableDomainTracer = flag.Bool("enable-domain-tracer", false, "Enable tracing domain names from requests")
 
-func (p *Proxy) log(message string) {
-	if p.Verbose {
-		log.Println("[PROXY]", message)
-	}
-}
-
-func (p *Proxy) isHostAllowed(host string) bool {
-	if len(p.AllowedHosts) == 0 {
-		return true
-	}
-
-	for _, allowed := range p.AllowedHosts {
-		if strings.Contains(host, allowed) {
-			return true
-		}
-	}
-	return false
-}
-
-func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Log the request
-	p.log(fmt.Sprintf("Received request: %s %s", r.Method, r.URL))
-
-	// Check if CONNECT method (HTTPS tunneling)
-	if r.Method == http.MethodConnect {
-		p.handleHttpsTunnel(w, r)
-		return
-	}
-
-	// Handle regular HTTP proxy request
-	p.handleHttpProxy(w, r)
-}
-
-func (p *Proxy) handleHttpProxy(w http.ResponseWriter, r *http.Request) {
-	// Validate host
-	if !p.isHostAllowed(r.Host) {
-		http.Error(w, "Access Denied", http.StatusForbidden)
-		return
-	}
-
-	// Remove proxy-specific headers
-	r.RequestURI = ""
-
-	// Create a new client
-	client := &http.Client{
-		Timeout: 30 * time.Second,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse // Disable automatic redirects
-		},
-	}
-
-	// Forward the request
-	resp, err := client.Do(r)
-	if err != nil {
-		p.log(fmt.Sprintf("Proxy request error: %v", err))
-		http.Error(w, "Proxy Error", http.StatusInternalServerError)
-		return
-	}
-	defer resp.Body.Close()
-
-	// Copy response headers
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
-
-	// Set status code
-	w.WriteHeader(resp.StatusCode)
-
-	// Copy response body
-	io.Copy(w, resp.Body)
-}
-
-func (p *Proxy) handleHttpsTunnel(w http.ResponseWriter, r *http.Request) {
-	// Extract destination host
-	host := r.Host
-
-	// Validate host
-	if !p.isHostAllowed(host) {
-		http.Error(w, "Access Denied", http.StatusForbidden)
-		return
-	}
-
-	p.log(fmt.Sprintf("CONNECT request to: %s", host))
-
-	// Hijack the connection
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
-		return
-	}
-
-	// Get the client connection
-	clientConn, _, err := hijacker.Hijack()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer clientConn.Close()
-
-	// Establish connection to the destination
-	serverConn, err := net.DialTimeout("tcp", host, 10*time.Second)
-	if err != nil {
-		p.log(fmt.Sprintf("Connection error: %v", err))
-		clientConn.Write([]byte("HTTP/1.1 500 Connection Failed\r\n\r\n"))
-		return
-	}
-	defer serverConn.Close()
-
-	// Send successful connection response
-	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
-
-	// Create bidirectional tunnel
-	errChan := make(chan error, 2)
-
-	// Client to server
-	go func() {
-		_, err := io.Copy(serverConn, clientConn)
-		errChan <- err
-	}()
-
-	// Server to client
-	go func() {
-		_, err := io.Copy(clientConn, serverConn)
-		errChan <- err
-	}()
-
-	// Wait for first error or completion
-	<-errChan
+type domainTracker interface {
+	Inc(domain string)
+	Dump() map[string]uint64
 }
 
 func main() {
-	proxy := &Proxy{
-		AllowedHosts: []string{
-			"api.ipify.org",
-			"example.com",
-			"github.com",
+	flag.Parse()
+	setLoggerFormat(*logLevel)
+
+	var wg sync.WaitGroup
+
+	sm, err := proxy.NewStickyMapper(*stickyStoragePath)
+	if err != nil {
+		_ = log.Criticalf("Failed to create sticky mapper, %v", err)
+		os.Exit(1)
+	}
+
+	var domainTracer domainTracker = proxy.NewNoopTracer()
+	if *enableDomainTracer {
+		domainTracer = proxy.NewDomainTracer()
+	}
+
+	apiServer := api.NewServer(*proxyAPIAddr, sm, domainTracer)
+	wg.Add(1)
+	go func() {
+		if err := apiServer.ListenAndServe(); err != nil {
+			_ = log.Criticalf("Failed to start API: %v", err)
+			os.Exit(1)
+		}
+
+		wg.Done()
+	}()
+
+	var dialer netproxy.Dialer
+ 
+	upstreamConfigs.parseUpstreamUrl("http://95.217.234.2:10003")
+	for _, upstreamConfig := range upstreamConfigs.configs {
+		var dialerDefault netproxy.Dialer = proxy.DialerDirect
+		if dialer != nil {
+			dialerDefault = dialer
+		}
+		dialerUpstream := proxy.NewDialerHTTPConnect(proxy.DialerDirect, upstreamConfig.url, upstreamConfig.user, upstreamConfig.password, upstreamConfig.country)
+
+		if len(upstreamConfig.filterHostnames) > 0 || len(upstreamConfig.filterZones) > 0 {
+			dialerUpstreamFiltered := netproxy.NewPerHost(dialerDefault, dialerUpstream)
+			for _, host := range upstreamConfig.filterHostnames {
+				log.Infof("Redirecting: %s -> %s", host, upstreamConfig.url)
+				dialerUpstreamFiltered.AddHost(host)
+			}
+			for _, zone := range upstreamConfig.filterZones {
+				log.Infof("Redirecting: *.%s -> %s", zone, upstreamConfig.url)
+				dialerUpstreamFiltered.AddZone(zone)
+			}
+			dialer = dialerUpstreamFiltered
+		} else {
+			dialer = dialerUpstream
+			log.Infof("Redirecting: * -> %s", upstreamConfig.url)
+		}
+		if len(upstreamConfig.excludeHostnames) > 0 || len(upstreamConfig.excludeZones) > 0 {
+			dialerUpstreamExcluded := netproxy.NewPerHost(dialer, dialerDefault)
+			for _, host := range upstreamConfig.excludeHostnames {
+				log.Infof("Excluding: %s -> %s", host, upstreamConfig.url)
+				dialerUpstreamExcluded.AddHost(host)
+			}
+			for _, zone := range upstreamConfig.excludeZones {
+				log.Infof("Excluding: *.%s -> %s", zone, upstreamConfig.url)
+				dialerUpstreamExcluded.AddZone(zone)
+			}
+			dialer = dialerUpstreamExcluded
+		}
+	}
+
+	allowedSubnets, allowedIPs, err := parseAllowedAddresses(*proxyAllow)
+	if err != nil {
+		_ = log.Criticalf("Failed to parse allowed addresses: %v", err)
+		os.Exit(1)
+	}
+	portMap, err := parsePortMap(*proxyMapPort, *proxyAddr)
+	if err != nil {
+		_ = log.Criticalf("Failed to parse port map: %v", err)
+		os.Exit(1)
+	}
+	metricService, err := metrics.NewMetricsService()
+	if err != nil {
+		_ = log.Criticalf("Failed to start metrics service: %s", err)
+		os.Exit(1)
+	}
+
+	proxyServer := proxy.NewServer(allowedSubnets, allowedIPs, dialer, sm, domainTracer, portMap, metricService.ProxyHandlerMiddleware)
+	for p := range portMap {
+		wg.Add(1)
+		go func(p string) {
+			if err := proxyServer.ListenAndServe(":" + p); err != nil {
+				_ = log.Criticalf("Failed to start HTTPS proxy: %v", err)
+				os.Exit(1)
+			}
+			wg.Done()
+		}(p)
+	}
+
+	wg.Wait()
+}
+
+func setLoggerFormat(levelStr string) {
+	level, _ := log.LogLevelFromString(levelStr)
+	writer, _ := log.NewConsoleWriter()
+	logger, _ := log.LoggerFromWriterWithMinLevelAndFormat(writer, level, "%Date %Time [%LEVEL] %Msg%n")
+	log.ReplaceLogger(logger)
+}
+
+func parseAllowedAddresses(addresses flagArray) (subnets []*net.IPNet, ips []net.IP, _ error) {
+	for _, address := range addresses {
+		if _, subnet, err := net.ParseCIDR(address); err == nil {
+			subnets = append(subnets, subnet)
+			continue
+		}
+		if ip := net.ParseIP(address); ip != nil {
+			ips = append(ips, ip)
+			continue
+		}
+		return nil, nil, errors.Errorf("invalid subnet or IP: %s", address)
+	}
+
+	return subnets, ips, nil
+}
+
+func parsePortMap(ports flagArray, proxyAddr string) (map[string]string, error) {
+	_, port, err := net.SplitHostPort(proxyAddr)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to parse port")
+	}
+
+	portsMap := map[string]string{port: "443"}
+
+	for _, p := range ports {
+		portMap := strings.Split(p, ":")
+		if len(portMap) != 2 {
+			return nil, errors.Errorf("failed to parse port mapping: %s", p)
+		}
+		portsMap[portMap[0]] = portMap[1]
+	}
+	return portsMap, nil
+}
+
+// FlagArray defines a string array flag
+func FlagArray(name string, usage string) *flagArray {
+	p := &flagArray{}
+	flag.Var(p, name, usage)
+	return p
+}
+
+type flagArray []string
+
+func (flag *flagArray) String() string {
+	return strings.Join(*flag, ",")
+}
+
+func (flag *flagArray) Set(s string) error {
+	*flag = strings.FieldsFunc(s, func(c rune) bool {
+		return c == ','
+	})
+	return nil
+}
+
+type flagUpstreamConfig struct {
+	url              *url.URL
+	user             string
+	password         string
+	country          string
+	filterHostnames  flagArray
+	filterZones      flagArray
+	excludeHostnames flagArray
+	excludeZones     flagArray
+}
+
+// FlagUpstreamConfig defines list of configure upstream proxies.
+func FlagUpstreamConfig() *flagUpstreamConfigs {
+	fuc := &flagUpstreamConfigs{
+		configs: []flagUpstreamConfig{
+			{},
 		},
-		Verbose: true,
+		configCurrent: 0,
+	}
+	flag.Func(
+		"proxy.upstream-url",
+		`Upstream HTTPS proxy where to forward traffic (e.g. "http://superproxy.com:8080")`,
+		fuc.parseUpstreamUrl,
+	)
+	flag.Func("proxy.user", "HTTPS proxy auth user", fuc.parseUpstreamUser)
+	flag.Func("proxy.pass", "HTTP proxy auth password", fuc.parseUpstreamPass)
+	flag.Func("proxy.country", "HTTP proxy country targeting", fuc.parseUpstreamCountry)
+	flag.Func(
+		"filter.hostnames",
+		`Explicitly forward just several hostnames (separated by comma - "ipinfo.io,ipify.org")`,
+		fuc.parseFilterHostnames,
+	)
+	flag.Func(
+		"filter.zones",
+		`Explicitly forward just several DNS zones. A zone of "example.com" matches "example.com" and all of its subdomains. (separated by comma - "ipinfo.io,ipify.org")`,
+		fuc.parseFilterZones,
+	)
+	flag.Func(
+		"exclude.hostnames",
+		`Exclude from forwarding several hostnames (separated by comma - "ipinfo.io,ipify.org")`,
+		fuc.parseExcludeHostnames,
+	)
+	flag.Func(
+		"exclude.zones",
+		`Exclude from forwarding several DNS zones. A zone of "example.com" matches "example.com" and all of its subdomains. (separated by comma - "ipinfo.io,ipify.org")`,
+		fuc.parseExcludeZones,
+	)
+
+	return fuc
+}
+
+type flagUpstreamConfigs struct {
+	configs       []flagUpstreamConfig
+	configCurrent int
+}
+
+func (fuc *flagUpstreamConfigs) current() *flagUpstreamConfig {
+	return &fuc.configs[fuc.configCurrent]
+}
+
+func (fuc *flagUpstreamConfigs) increment() {
+	fuc.configs = append(fuc.configs, flagUpstreamConfig{})
+	fuc.configCurrent++
+}
+
+func (fuc *flagUpstreamConfigs) parseUpstreamUrl(s string) error {
+	upstreamUrl, err := url.Parse(s)
+	if err != nil {
+		return fmt.Errorf("invalid upstream URL: %s. %v", s, err)
 	}
 
-	// Create server
-	server := &http.Server{
-		Addr:         ":8090",
-		Handler:      proxy,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+	if fuc.configs[fuc.configCurrent].url != nil {
+		fuc.increment()
 	}
+	fuc.configs[fuc.configCurrent].url = upstreamUrl
+	return nil
+}
 
-	log.Println("Proxy server starting on :8080")
-	log.Fatal(server.ListenAndServe())
+func (fuc *flagUpstreamConfigs) parseUpstreamUser(s string) error {
+	fuc.configs[fuc.configCurrent].user = s
+	return nil
+}
+
+func (fuc *flagUpstreamConfigs) parseUpstreamPass(s string) error {
+	fuc.configs[fuc.configCurrent].password = s
+	return nil
+}
+
+func (fuc *flagUpstreamConfigs) parseUpstreamCountry(s string) error {
+	fuc.configs[fuc.configCurrent].country = s
+	return nil
+}
+
+func (fuc *flagUpstreamConfigs) parseFilterHostnames(s string) error {
+	return fuc.configs[fuc.configCurrent].filterHostnames.Set(s)
+}
+
+func (fuc *flagUpstreamConfigs) parseFilterZones(s string) error {
+	return fuc.configs[fuc.configCurrent].filterZones.Set(s)
+}
+
+func (fuc *flagUpstreamConfigs) parseExcludeHostnames(s string) error {
+	return fuc.configs[fuc.configCurrent].excludeHostnames.Set(s)
+}
+
+func (fuc *flagUpstreamConfigs) parseExcludeZones(s string) error {
+	return fuc.configs[fuc.configCurrent].excludeZones.Set(s)
 }
