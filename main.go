@@ -25,14 +25,18 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	log "github.com/cihub/seelog"
 	"github.com/pkg/errors"
 	netproxy "golang.org/x/net/proxy"
 
-	"github.com/mysteriumnetwork/openvpn-forwarder/api"
-	"github.com/mysteriumnetwork/openvpn-forwarder/metrics"
-	"github.com/mysteriumnetwork/openvpn-forwarder/proxy"
+	"github.com/HeraclesG/myst-go-proxy/metrics"
+	"github.com/HeraclesG/myst-go-proxy/proxy"
+	"github.com/HeraclesG/myst-go-proxy/proxy/auth"
+	"github.com/HeraclesG/myst-go-proxy/proxy/provider"
+	"github.com/HeraclesG/myst-go-proxy/proxy/username"
+	"github.com/pariz/gountries"
 )
 
 var logLevel = flag.String("log.level", log.InfoStr, "Set the logging level (trace, debug, info, warn, error, critical)")
@@ -69,20 +73,42 @@ func main() {
 		domainTracer = proxy.NewDomainTracer()
 	}
 
-	apiServer := api.NewServer(*proxyAPIAddr, sm, domainTracer)
-	wg.Add(1)
-	go func() {
-		if err := apiServer.ListenAndServe(); err != nil {
-			_ = log.Criticalf("Failed to start API: %v", err)
-			os.Exit(1)
-		}
+	// apiServer := api.NewServer(*proxyAPIAddr, sm, domainTracer)
+	// wg.Add(1)
+	// go func() {
+	// 	if err := apiServer.ListenAndServe(); err != nil {
+	// 		_ = log.Criticalf("Failed to start API: %v", err)
+	// 		os.Exit(1)
+	// 	}
 
-		wg.Done()
-	}()
+	// 	wg.Done()
+	// }()
 
 	var dialer netproxy.Dialer
- 
+
+	// New Features For Proxy
+	parser := username.NewBaseUsername(time.Duration(10)*time.Second, time.Duration(3600)*time.Second, gountries.New())
+	a, err := auth.NewRedisGCache(
+		10,
+		300,
+		"zombie",
+		parser,
+	)
+	sessionStorage := proxy.NewSession()
+	cleaner := sessionStorage.StartAutoCleaner(5 * time.Second)
+	defer cleaner.Stop()
+	defer sessionStorage.Close()
+	orchestrator := proxy.NewOrchestra([]proxy.Provider{})
+
+	upstreamConfigs.parseUpstreamUrl("http://95.217.234.2:10002")
+	upstreamConfigs.parseUpstreamCountry("IT")
 	upstreamConfigs.parseUpstreamUrl("http://95.217.234.2:10003")
+	upstreamConfigs.parseUpstreamCountry("IT")
+	upstreamConfigs.parseUpstreamUrl("http://95.217.234.2:10004")
+	upstreamConfigs.parseUpstreamCountry("DE")
+	upstreamConfigs.parseUpstreamUrl("http://95.217.234.2:10005")
+	upstreamConfigs.parseUpstreamCountry("DE")
+
 	for _, upstreamConfig := range upstreamConfigs.configs {
 		var dialerDefault netproxy.Dialer = proxy.DialerDirect
 		if dialer != nil {
@@ -103,6 +129,7 @@ func main() {
 			dialer = dialerUpstreamFiltered
 		} else {
 			dialer = dialerUpstream
+			orchestrator.AddProvider(provider.NewMystProvider(upstreamConfig.url.Host, dialerUpstream, upstreamConfig.country, "residential", "", false, ""))
 			log.Infof("Redirecting: * -> %s", upstreamConfig.url)
 		}
 		if len(upstreamConfig.excludeHostnames) > 0 || len(upstreamConfig.excludeZones) > 0 {
@@ -135,7 +162,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	proxyServer := proxy.NewServer(allowedSubnets, allowedIPs, dialer, sm, domainTracer, portMap, metricService.ProxyHandlerMiddleware)
+	proxyServer := proxy.NewServer(allowedSubnets, allowedIPs, dialer, sm, domainTracer, portMap, metricService.ProxyHandlerMiddleware, parser, a, orchestrator, sessionStorage)
 	for p := range portMap {
 		wg.Add(1)
 		go func(p string) {

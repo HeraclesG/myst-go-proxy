@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"strings"
 	"syscall"
 	"unsafe"
@@ -33,6 +34,10 @@ import (
 	"github.com/pkg/errors"
 	"github.com/soheilhy/cmux"
 	netproxy "golang.org/x/net/proxy"
+)
+
+const (
+	strHeaderBasicRealm = "Basic realm=\"\"\r\n\r\n"
 )
 
 type handlerMiddleware func(func(c *Context)) func(*Context)
@@ -49,6 +54,10 @@ type proxyServer struct {
 	dt                domainTracker
 	portMap           map[string]string
 	handlerMiddleware handlerMiddleware
+	parser            UsernameParser
+	auth              Auth
+	orchestrator      *Orchestra
+	sessionStorage    *Sessions
 }
 
 // StickyMapper represent connection stickiness storage.
@@ -66,6 +75,10 @@ func NewServer(
 	dt domainTracker,
 	portMap map[string]string,
 	handlerMiddleware handlerMiddleware,
+	parser UsernameParser,
+	auth Auth,
+	orchestrator *Orchestra,
+	sessionStorage *Sessions,
 ) *proxyServer {
 	return &proxyServer{
 		allowedSubnets:    allowedSubnets,
@@ -75,6 +88,10 @@ func NewServer(
 		dt:                dt,
 		portMap:           portMap,
 		handlerMiddleware: handlerMiddleware,
+		parser:            parser,
+		auth:              auth,
+		orchestrator:      orchestrator,
+		sessionStorage:    sessionStorage,
 	}
 }
 
@@ -166,13 +183,60 @@ func (s *proxyServer) serveHTTP(c *Context) {
 		return
 	}
 
+	username, password, err := extractCredentials(req, req)
+	fmt.Println("Username:", username)
+	fmt.Println("Password:", password)
+	if err != nil {
+		// Set the response header and status code
+		response := "HTTP/1.1 407 Proxy Authentication Required\r\n" +
+			"Proxy-Authenticate: Basic realm=\"\"\r\n" +
+			"Content-Length: 0\r\n" +
+			"\r\n"
+		// Write the response to the connection
+		c.conn.Write([]byte(response))
+		return
+	}
+
+	request := acquireRequest()
+	request.Done = make(chan struct{}, 1)
+	// host, _, err := net.SplitHostPort(req.RemoteAddr)
+	// if err != nil {
+	// 	sendBadRequest(c.conn)
+	// 	releaseRequest(request)
+	// 	return
+	// }
+
+	// userIP := net.ParseIP(host)
+	// if userIP == nil {
+	// 	sendBadRequest(c.conn)
+	// 	releaseRequest(request)
+	// 	return
+	// }
+	// request.UserIP = userIP.String()
+
+	err = parseRequest(req.Host, username, password, request, s.parser)
+	if err != nil {
+		sendBadRequest(c.conn)
+		releaseRequest(request)
+		return
+	}
+
+	// cleanRequestHeaders(req)
+	err = s.selectProvider(request)
+	if err != nil {
+		sendBadRequest(c.conn)
+		releaseRequest(request)
+		return
+	}
+
 	c.setHost(req.Host)
 	c.destinationAddress = s.authorityAddr("http", c.destinationHost)
 	s.logAccess("HTTP request", c)
 
-	conn, err := s.connectTo(c, c.destinationAddress)
+	conn, err := s.connectTo(c, c.destinationAddress, request)
 	if err != nil {
 		s.logError(fmt.Sprintf("Failed to establishing connection. %v", err), c)
+		releaseRequest(request)
 		return
 	}
 	defer conn.Close()
@@ -181,11 +245,55 @@ func (s *proxyServer) serveHTTP(c *Context) {
 		c.conn.Write([]byte("HTTP/1.0 200 OK\r\n\r\n"))
 	} else if err := req.Write(conn); err != nil {
 		s.logError(fmt.Sprintf("Failed to forward HTTP request. %v", err), c)
+		releaseRequest(request)
 		return
 	}
 
+	releaseRequest(request)
 	go io.Copy(conn, c.conn)
 	io.Copy(c.conn, conn)
+
+}
+
+func (p *proxyServer) selectProvider(request *Request) error {
+	var err error
+
+	if request.SessionID != "" {
+		var ok bool
+		request.Provider, ok = p.sessionStorage.Cached(request)
+		if !ok {
+			fmt.Println("Failed to cache session")
+			request.Provider, ok = p.orchestrator.GetIdle(request)
+			if !ok {
+				return errors.New("failed to get provider")
+			}
+
+			request.Provider.SetBinded(true)
+			err = p.sessionStorage.Start(request)
+			if err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+
+	var ok bool
+	request.Provider, ok = p.orchestrator.GetIdle(request)
+	if ok {
+		request.Provider.SetBinded(true)
+		return nil
+	} else {
+		return errors.New("failed to get provider")
+	}
+
+}
+
+func sendBadRequest(conn net.Conn) {
+	response := "HTTP/1.1 400 Bad Request\r\n" +
+		"Content-Length: 0\r\n" +
+		"\r\n"
+	conn.Write([]byte(response))
 }
 
 func (s *proxyServer) authorityAddr(scheme, authority string) string {
@@ -239,7 +347,7 @@ func (s *proxyServer) serveTLS(c *Context) {
 	}
 	s.logAccess("HTTPS request", c)
 
-	conn, err := s.connectTo(c, c.destinationAddress)
+	conn, err := s.connectTo(c, c.destinationAddress, nil)
 	if err != nil {
 		s.logError(fmt.Sprintf("Failed to establishing connection. %v", err), c)
 		return
@@ -250,11 +358,14 @@ func (s *proxyServer) serveTLS(c *Context) {
 	io.Copy(tlsConn, conn)
 }
 
-func (s *proxyServer) connectTo(c *Context, remoteHost string) (conn io.ReadWriteCloser, err error) {
+func (s *proxyServer) connectTo(c *Context, remoteHost string, request *Request) (conn io.ReadWriteCloser, err error) {
 	domain := strings.Split(remoteHost, ":")
 	s.dt.Inc(domain[0])
-
-	conn, err = s.dialer.Dial("tcp", remoteHost)
+	if request != nil {
+		conn, err = request.Provider.Dialer().Dial("tcp", remoteHost)
+	} else {
+		conn, err = s.dialer.Dial("tcp", remoteHost)
+	}
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to establish connection")
 	}
@@ -291,17 +402,34 @@ func getOriginalDst(conn *net.TCPConn) (*net.TCPAddr, error) {
 	defer f.Close()
 
 	fd := int(f.Fd())
+	fmt.Println("fd:", runtime.GOOS)
+	// if runtime.GOOS == "windows" {
+	fmt.Println("Running on Windows")
+	const (
+		FIONBIO = 0x8004667E // Windows-specific ioctl for non-blocking
+	)
+	nonBlocking := byte(1)
 	// revert to non-blocking mode.
 	// see http://stackoverflow.com/a/28968431/1493661
-	if err = syscall.SetNonblock(fd, true); err != nil {
+	if err = syscall.WSAIoctl(
+		syscall.Handle(fd),
+		FIONBIO,
+		&nonBlocking,
+		4,
+		nil,
+		0,
+		nil,
+		nil,
+		0,
+	); err != nil {
 		return nil, os.NewSyscallError("setnonblock", err)
 	}
 
 	// IPv4
 	var addr syscall.RawSockaddrInet4
-	var len uint32
-	len = uint32(unsafe.Sizeof(addr))
-	err = getSockOpt(fd, syscall.IPPROTO_IP, SO_ORIGINAL_DST, unsafe.Pointer(&addr), &len)
+	var len int32
+	len = int32(unsafe.Sizeof(addr))
+	err = getSocketOptWindows(fd, syscall.IPPROTO_IP, SO_ORIGINAL_DST, unsafe.Pointer(&addr), &len)
 	if err != nil {
 		return nil, os.NewSyscallError("getSockOpt", err)
 	}
@@ -316,22 +444,71 @@ func getOriginalDst(conn *net.TCPConn) (*net.TCPAddr, error) {
 		IP:   ip,
 		Port: int(pb[0])*256 + int(pb[1]),
 	}, nil
+	// }
+	// Windows-specific code here
+	// } else {
+	//     fmt.Println("Running on Linux")
+	// 	if err = syscall.SetNonblock(fd, true); err != nil {
+	// 		return nil, os.NewSyscallError("setnonblock", err)
+	// 	}
+
+	// 	// IPv4
+	// 	var addr syscall.RawSockaddrInet4
+	// 	var len uint32
+	// 	len = uint32(unsafe.Sizeof(addr))
+	// 	err = getSockOpt(fd, syscall.IPPROTO_IP, SO_ORIGINAL_DST, unsafe.Pointer(&addr), &len)
+	// 	if err != nil {
+	// 		return nil, os.NewSyscallError("getSockOpt", err)
+	// 	}
+
+	// 	ip := make([]byte, 4)
+	// 	for i, b := range addr.Addr {
+	// 		ip[i] = b
+	// 	}
+	// 	pb := *(*[2]byte)(unsafe.Pointer(&addr.Port))
+
+	// 	return &net.TCPAddr{
+	// 		IP:   ip,
+	// 		Port: int(pb[0])*256 + int(pb[1]),
+	// 	}, nil
+	//     // Linux-specific code here
+	// }
+	// revert to non-blocking mode.
+	// see http://stackoverflow.com/a/28968431/1493661
+
 }
 
-func getSockOpt(s int, level int, optname int, optval unsafe.Pointer, optlen *uint32) (err error) {
-	_, _, e := syscall.Syscall6(
-		syscall.SYS_GETSOCKOPT,
-		uintptr(s),
-		uintptr(level),
-		uintptr(optname),
-		uintptr(optval),
-		uintptr(unsafe.Pointer(optlen)),
-		0,
-	)
-	if e != 0 {
-		return e
+// func getSockOpt(s int, level int, optname int, optval unsafe.Pointer, optlen *uint32) (err error) {
+
+// 	_, _, e := syscall.Syscall6(
+// 		syscall.SYS_GETSOCKOPT,
+// 		uintptr(s),
+// 		uintptr(level),
+// 		uintptr(optname),
+// 		uintptr(optval),
+// 		uintptr(unsafe.Pointer(optlen)),
+// 		0,
+// 	)
+// 	if e != 0 {
+// 		return e
+// 	}
+// 	return
+// }
+
+func getSocketOptWindows(
+	socket int,
+	level,
+	optname int,
+	optval unsafe.Pointer,
+	optlen *int32,
+) error {
+	// Windows uses a different syscall mechanism
+	h := syscall.Handle(socket)
+	err := syscall.Getsockopt(h, int32(level), int32(optname), (*byte)(optval), optlen)
+	if err != nil {
+		return fmt.Errorf("windows getsockopt error: %v", err)
 	}
-	return
+	return nil
 }
 
 func (s *proxyServer) logAccess(message string, c *Context) {

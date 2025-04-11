@@ -21,8 +21,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-
-	"github.com/mysteriumnetwork/openvpn-forwarder/proxy"
+	"github.com/HeraclesG/myst-go-proxy/proxy"
 )
 
 type service struct {
